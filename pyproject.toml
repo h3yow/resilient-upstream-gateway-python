@@ -6,6 +6,18 @@ dependencies = [
     "fastapi[standard]>=0.141.1",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+asyncio_mode = "auto"
+
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 default = true
