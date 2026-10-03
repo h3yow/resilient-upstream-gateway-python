@@ -35,17 +35,28 @@ class Upstream(Protocol):
 
 @dataclass
 class UpstreamRuntime:
-    """一个上游的全部可变运行时状态。"""
+    """一个上游的全部可变运行时状态。
+
+    ``weight`` 与 ``state`` 是运行期可调的管理面策略，与计数器
+    一样只在 ``lock`` 内读写：策略修改与在途请求并发时，
+    在途请求按进入时的判断跑完，新请求立刻看到新值，
+    计数不会重复或丢失。
+    """
 
     config: UpstreamConfig
     breaker: CircuitBreaker
     limiter: RateLimiter
     state: UpstreamState = UpstreamState.HEALTHY
+    weight: int = 0  # 0 表示"未显式设置"，构造后由注册表初始化为 config.weight
     active_calls: int = 0
     success_count: int = 0
     failure_count: int = 0
     rejection_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def __post_init__(self) -> None:
+        if self.weight == 0:
+            self.weight = max(1, self.config.weight)
 
 
 class SimulatedUpstream:
@@ -132,6 +143,50 @@ class UpstreamRegistry:
     def get(self, name: str) -> UpstreamRuntime:
         return self._runtimes[name]
 
+    # ------------------------------------------------------------------
+    # 运行期策略调整（管理面）：全部在目标副本自己的锁内完成，
+    # 不触碰计数器；在途请求按进入时的判断跑完，新请求立即生效。
+    # ------------------------------------------------------------------
+    def update_policy(
+        self,
+        name: str,
+        *,
+        weight: int | None = None,
+        capacity: float | None = None,
+        refill_per_second: float | None = None,
+    ) -> dict[str, object]:
+        """不重启调整某副本的权重 / 承载能力，返回生效后的策略。"""
+        rt = self._runtimes[name]
+        with rt.lock:
+            if weight is not None:
+                rt.weight = max(1, int(weight))
+            if capacity is not None or refill_per_second is not None:
+                rt.limiter.reconfigure(
+                    capacity if capacity is not None else rt.limiter.capacity,
+                    refill_per_second
+                    if refill_per_second is not None
+                    else rt.limiter.refill_per_second,
+                )
+            return {
+                "name": name,
+                "weight": rt.weight,
+                "capacity": rt.limiter.capacity,
+                "refill_per_second": rt.limiter.refill_per_second,
+                "admin_state": rt.state.value,
+            }
+
+    def disable(self, name: str) -> None:
+        """临时停用：新请求不再选中；在途请求正常跑完并照常计数。"""
+        rt = self._runtimes[name]
+        with rt.lock:
+            rt.state = UpstreamState.DISABLED
+
+    def enable(self, name: str) -> None:
+        """重新启用：恢复为健康态参与选择（熔断器状态保持不变）。"""
+        rt = self._runtimes[name]
+        with rt.lock:
+            rt.state = UpstreamState.HEALTHY
+
     def impl(self, name: str) -> Upstream:
         return self._impls[name]
 
@@ -156,6 +211,8 @@ class UpstreamRegistry:
                     "shard": rt.config.shard,
                     "state": rt.breaker.state(),
                     "admin_state": rt.state,
+                    "weight": rt.weight,
+                    "capacity": rt.limiter.capacity,
                     "active_calls": rt.active_calls,
                     "success_count": rt.success_count,
                     "failure_count": rt.failure_count,

@@ -23,6 +23,7 @@ from gateway.errors import (
 )
 from gateway.limiter import RetryBudget
 from gateway.selector import UpstreamSelector
+from gateway.traffic import TrafficShiftManager
 from gateway.types import (
     AttemptRecord,
     FailureReason,
@@ -54,17 +55,24 @@ class Gateway:
         clock: Clock | None = None,
         selector: UpstreamSelector | None = None,
         retry_budget: RetryBudget | None = None,
+        traffic: TrafficShiftManager | None = None,
         executor: ThreadPoolExecutor | None = None,
     ) -> None:
         self._registry = registry
         self.config = config or GatewayConfig()
         self._clock = clock or SystemClock()
-        self._selector = selector or UpstreamSelector(registry)
+        self._traffic = traffic or TrafficShiftManager(registry, self._clock)
+        self._selector = selector or UpstreamSelector(registry, traffic=self._traffic)
         self._retry_budget = retry_budget or RetryBudget(self.config.retry, self._clock)
         self._executor = executor or ThreadPoolExecutor(
             max_workers=self.config.max_workers, thread_name_prefix="gw"
         )
         self._owns_executor = executor is None
+
+    @property
+    def traffic(self) -> TrafficShiftManager:
+        """灰度接管管理器（启动/查询接管计划）。"""
+        return self._traffic
 
     # ------------------------------------------------------------------
     def handle(self, request: GatewayRequest) -> GatewayResponse:
@@ -192,6 +200,27 @@ class Gateway:
                 attempt_no += 1
                 tried.add(name)
                 # 限流不计熔断失败；尝试下一副本，仅在还有预算时退避
+                if not self._sleep_backoff(attempt_no, deadline):
+                    break
+                continue
+
+            # 真正发起调用前才占用熔断探测名额（CLOSED 下恒成功）。
+            # 与选择器窥视之间可能存在竞争：并发请求抢走最后一个
+            # 半开名额时，本次让位给下一副本，不空占名额。
+            if not rt.breaker.acquire_probe():
+                rt.limiter.refund()
+                attempts.append(
+                    AttemptRecord(
+                        upstream=name,
+                        shard=shard,
+                        attempt=attempt_no + 1,
+                        outcome=_OUTCOME_CIRCUIT_OPEN,
+                        detail="half-open probe slot taken by concurrent request",
+                        elapsed_seconds=0.0,
+                    )
+                )
+                attempt_no += 1
+                tried.add(name)
                 if not self._sleep_backoff(attempt_no, deadline):
                     break
                 continue

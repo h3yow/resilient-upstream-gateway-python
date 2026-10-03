@@ -49,10 +49,40 @@ class CircuitBreaker:
             return self._state
 
     def allow_request(self) -> bool:
-        """是否放行本次调用。
+        """是否放行本次调用（占用式，兼容旧接口）。
 
         CLOSED 总是放行；OPEN 冷却未过一律拒绝（快速失败）；
         HALF_OPEN 仅在探测名额内放行，名额外的流量继续快速失败。
+        等价于 ``acquire_probe``：返回 True 即占用一个探测名额，
+        调用方必须随后 ``record_success`` / ``record_failure`` /
+        ``release_probe`` 之一归还结论，否则名额泄漏。
+        """
+        return self.acquire_probe()
+
+    def probe_available(self) -> bool:
+        """只读检查：当前是否允许放行（不占用探测名额）。
+
+        供选择器做候选筛选使用——筛选阶段不能消耗名额，否则
+        候选被列出但未被真正调用时名额会永久泄漏，副本将永远
+        停在 HALF_OPEN 无法恢复。
+        """
+        with self._lock:
+            self._maybe_enter_half_open_locked()
+            if self._state is _CLOSED:
+                return True
+            if self._state is _OPEN:
+                return False
+            return (
+                self._probes_in_flight < self.config.half_open_max_probe
+                and self._probes_tried < self.config.success_to_close
+            )
+
+    def acquire_probe(self) -> bool:
+        """占用式放行：返回 True 表示本次调用被允许且已记账。
+
+        HALF_OPEN 下占用一个探测名额（受 ``half_open_max_probe``
+        与 ``success_to_close`` 双重上界约束，探测流量不会因
+        并发涌入而放大）。
         """
         with self._lock:
             self._maybe_enter_half_open_locked()
@@ -69,6 +99,18 @@ class CircuitBreaker:
             self._probes_in_flight += 1
             self._probes_tried += 1
             return True
+
+    def release_probe(self) -> None:
+        """放弃一个已占用但未真正发起调用的探测名额。
+
+        用于"选中后未调用"的路径（如占用名额后被限流、或请求
+        截止时间已到）：名额归还、不计成败，保证每个副本最终
+        都能被真正探测到，不会因名额泄漏而永远停在 HALF_OPEN。
+        """
+        with self._lock:
+            if self._state is _HALF_OPEN:
+                self._probes_in_flight = max(0, self._probes_in_flight - 1)
+                self._probes_tried = max(0, self._probes_tried - 1)
 
     def record_success(self) -> None:
         with self._lock:

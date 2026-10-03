@@ -75,6 +75,10 @@ class BuiltScenario:
     registry: UpstreamRegistry
     config: GatewayConfig
 
+    @property
+    def traffic(self):
+        return self.gateway.traffic
+
 
 def build_gateway(
     behaviors: dict[str, dict] | None = None,

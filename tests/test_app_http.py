@@ -84,3 +84,44 @@ def test_upstreams_snapshot_endpoint():
     assert total_ok == len(SHARDS)
     assert all(v["active_calls"] == 0 for v in body.values())
     print(f"[场景] /upstreams 显示 {total_ok} 次成功计数，与 3 个分片一致")
+
+
+def test_admin_policy_update_over_http():
+    c = _client({})
+    r = c.post("/admin/upstreams/users-0/policy", json={"weight": 500, "capacity": 8})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["weight"] == 500
+    assert body["capacity"] == 8.0
+    snap = c.get("/upstreams").json()["upstreams"]
+    assert snap["users-0"]["weight"] == 500
+    assert snap["users-0"]["capacity"] == 8.0
+    assert c.post("/admin/upstreams/nope/policy", json={"weight": 1}).status_code == 404
+    print("[场景] HTTP 运行期改权重/容量 -> 立即生效并可在 /upstreams 观测")
+
+
+def test_admin_traffic_shift_over_http():
+    c = _client({})
+    r = c.post(
+        "/admin/traffic/shift",
+        json={
+            "shard": "users",
+            "source": "users-0",
+            "target": "users-1",
+            "start_share": 0.2,
+            "step_share": 0.2,
+            "step_seconds": 0.05,
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["users"]["phase"] == "ramping"
+    st = c.get("/admin/traffic/status", params={"shard": "users"}).json()["shifts"]["users"]
+    assert st["current_share"] >= 0.2
+    assert st["effective_weights"]["users-0"] == 1.0
+    # 跨分片计划被拒绝
+    bad = c.post(
+        "/admin/traffic/shift",
+        json={"shard": "orders", "source": "users-0", "target": "users-1"},
+    )
+    assert bad.status_code == 400
+    print(f"[场景] HTTP 启动灰度接管 -> phase=ramping 份额可观测: {st['current_share']}")

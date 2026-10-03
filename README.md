@@ -100,7 +100,75 @@ retry_budget_exhausted / request_deadline`）与固定文案，响应中只出�
 - 分片结论优先级：出现过超时 → `timeout`；否则出现过上游错误 →
   `upstream_error`；否则（全部停用/熔断/限流）→ `no_capacity`。
 
-## 6. 配置项
+## 6. 运行期策略调整（不重启）
+
+`UpstreamRegistry` 提供管理面接口，所有修改在目标副本自己的锁内完成，
+**不触碰计数器**；与在途请求并发时语义为：
+
+- **在途请求**：按进入时的判断正常跑完，成功/失败照常计入该副本计数，
+  不被中途打断；
+- **新请求**：立即按新策略选择副本；
+- 成功/失败/拒绝/在途计数在任意并发翻转下保持一致，
+  `GET /upstreams` 的计数可与响应 `trace` 里的判定一一对上。
+
+| 操作 | Python API | HTTP |
+| --- | --- | --- |
+| 改权重 | `registry.update_policy(name, weight=...)` | `POST /admin/upstreams/{name}/policy {"weight": 500}` |
+| 改承载能力 | `registry.update_policy(name, capacity=..., refill_per_second=...)` | `POST /admin/upstreams/{name}/policy {"capacity": 8}` |
+| 临时停用 | `registry.disable(name)` | `POST /admin/upstreams/{name}/state {"state":"disabled"}` |
+| 重新启用 | `registry.enable(name)` | `POST /admin/upstreams/{name}/state {"state":"healthy"}` |
+
+承载能力调小时：在途调用不受影响（结束时 `refund` 只补到新容量上限），
+桶内余量立即截断到新容量，新请求立刻按新容量放行或 `rate_limited` 拒绝。
+
+## 7. 灰度流量接管（新副本平滑上线）
+
+`gateway/traffic.py` 的 `TrafficShiftManager` 把某分片流量从旧副本
+（source）平滑切到新副本（target）：
+
+- target 先分 `start_share` 的权重份额，每过 `step_seconds` 增加
+  `step_share`，直到 100%——此时 source 权重乘子归零（排空），接管完成；
+- 加码期间持续观察 target：新增失败（含超时）达到
+  `rollback_failure_threshold` 或 target 熔断打开，**立即撤回**——
+  target 乘子归零、source 保持全量，整体可用性不受影响；
+- 推进是惰性、时钟驱动的（与熔断器同风格），无需后台线程；
+- 进度随时可查：阶段（`ramping/complete/rolled_back`）、当前份额、
+  两个副本的生效权重、加码期失败数、推进历史。
+
+```python
+from gateway.traffic import TrafficShiftPlan
+gateway.traffic.start_shift(TrafficShiftPlan(
+    shard="users", source="users-0", target="users-1",
+    start_share=0.1, step_share=0.15, step_seconds=0.5,
+    rollback_failure_threshold=1,
+))
+gateway.traffic.status("users")   # phase/current_share/effective_weights/...
+```
+
+HTTP：`POST /admin/traffic/shift`（同参数 JSON）启动，
+`GET /admin/traffic/status?shard=users` 查询进度。
+
+## 8. 恢复路径的并发保证
+
+- 选择器筛选候选时只做**只读窥视**（`probe_available`），不占用半开
+  探测名额；编排器在真正发起调用前才 `acquire_probe` 占用，
+  "选中但未调用"（如被限流拦截、并发竞争落选）时名额被归还或不占用，
+  **不会泄漏**——任何副本都不会因名额泄漏而永远停在 HALF_OPEN；
+- 半开探测并发度恒受 `half_open_max_probe` 上界约束，请求洪峰不会
+  放大探测流量、不会把刚恢复的副本打回去；
+- 同一分片多个副本同时熔断、同时到冷却期时，每个副本都会被实际
+  探测并独立走回 CLOSED；彻底恢复后行为与从未故障一致。
+
+## 9. 兼容性
+
+- 响应三态语义、`failure_reason` 分类、`trace` 结构完全不变；
+- 既有静态配置（`UpstreamConfig.weight`、`RateLimiterConfig`）作为
+  初始值生效，运行期修改覆盖之，不重启不丢失计数；
+- 未启动任何接管计划时，流量乘子恒为 1.0，选择行为与旧版一致；
+- `CircuitBreaker.allow_request()` 保留（等价于 `acquire_probe`），
+  旧的直接调用方不受影响。
+
+## 10. 配置项
 
 | 配置 | 位置 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -116,20 +184,26 @@ retry_budget_exhausted / request_deadline`）与固定文案，响应中只出�
 | `request_timeout_seconds` | `RetryConfig` | 1.0 | 整个请求总截止时间 |
 | `per_attempt_timeout` | `GatewayConfig` | 0.2 | 单次上游调用超时 |
 | `max_workers` | `GatewayConfig` | 16 | 分片并发线程池大小 |
+| `start_share` / `step_share` / `step_seconds` | `TrafficShiftPlan` | 0.1 / 0.15 / 0.05 | 灰度初始份额、每步加码、阶梯间隔 |
+| `rollback_failure_threshold` | `TrafficShiftPlan` | 1 | 加码期允许的目标失败次数上限 |
 
 模拟上游行为表（`behaviors`，键为上游名）支持：`latency`（固定延迟）、
 `jitter`（随机抖动）、`fail_nth`（按调用序号报错）、
 `timeout_nth`（按调用序号超时）、`fail_every`（每 N 次报错一次）、
 `weight`、`capacity`、`refill_per_second`、`seed`。
 
-## 7. 本地验证
+## 11. 本地验证
 
 ```bash
 # 安装依赖（uv）
 uv sync
 
-# 运行全部单测（含熔断/重试/超时/缓慢恢复/状态抖动/并发计数一致性）
+# 运行全部单测（含熔断/重试/超时/缓慢恢复/状态抖动/并发计数一致性、
+# 运行期策略调整、灰度接管与撤回、多副本并发恢复）
 uv run pytest -s          # -s 可查看每个用例打印的[场景]与[判定]依据
+
+# 只跑新增能力
+uv run pytest tests/test_admin_policy.py tests/test_traffic_shift.py tests/test_recovery_concurrency.py -s
 
 # 启动 HTTP 服务（默认带演示故障注入场景）
 uv run python main.py     # http://127.0.0.1:8000
@@ -147,21 +221,29 @@ curl -s localhost:8000/upstreams                      # 状态与调用计数
 curl -s localhost:8000/scenario                       # 当前注入场景
 curl -s -X POST localhost:8000/admin/upstreams/orders-0/state \
   -H 'content-type: application/json' -d '{"state":"disabled"}'  # 手动停用
+curl -s -X POST localhost:8000/admin/upstreams/orders-0/policy \
+  -H 'content-type: application/json' -d '{"weight":500,"capacity":8}'  # 运行期改策略
+curl -s -X POST localhost:8000/admin/traffic/shift \
+  -H 'content-type: application/json' \
+  -d '{"shard":"users","source":"users-0","target":"users-1","step_seconds":0.5}'  # 灰度接管
+curl -s 'localhost:8000/admin/traffic/status?shard=users'          # 接管进度
 ```
 
-## 8. 代码结构
+## 12. 代码结构
 
 ```
 gateway/
   types.py       枚举、配置、请求/响应/尝试记录等稳定数据结构
   errors.py      内部异常层次（不对外透出）
   clock.py       单调时钟抽象
-  breaker.py     熔断器状态机
-  limiter.py     单上游令牌桶 + 全局重试预算桶
-  upstream.py    脚本化模拟上游 + 并发安全的注册表/计数
-  selector.py    健康/承载感知的候选选择与负载排序
+  breaker.py     熔断器状态机（探测名额窥视/占用/归还分离）
+  limiter.py     单上游令牌桶（运行期可调）+ 全局重试预算桶
+  upstream.py    脚本化模拟上游 + 并发安全的注册表/计数/策略调整
+  selector.py    健康/承载/灰度乘子感知的候选选择与负载排序
+  traffic.py     灰度流量接管：阶梯加码、健康观察、自动撤回
   gateway.py     编排器：并发、超时、重试、降级聚合（核心）
   scenarios.py   可复现故障注入场景工厂
   app.py         FastAPI 装配与观测/管理端点
-tests/           熔断器、限流器、选择器、编排集成、HTTP 层测试
+tests/           熔断器、限流器、选择器、编排集成、HTTP 层、
+                 运行期策略、灰度接管、并发恢复测试
 ```

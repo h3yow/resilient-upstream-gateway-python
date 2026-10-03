@@ -51,6 +51,26 @@ class StateBody(BaseModel):
     state: UpstreamState
 
 
+class PolicyBody(BaseModel):
+    """运行期策略调整：只传需要修改的字段。"""
+
+    weight: int | None = None
+    capacity: float | None = None
+    refill_per_second: float | None = None
+
+
+class ShiftBody(BaseModel):
+    """灰度接管计划：把 source 的流量平滑切到 target。"""
+
+    shard: str
+    source: str
+    target: str
+    start_share: float = 0.1
+    step_share: float = 0.15
+    step_seconds: float = 0.5
+    rollback_failure_threshold: int = 1
+
+
 def _response_to_dict(resp) -> dict:
     return {
         "request_id": resp.request_id,
@@ -116,6 +136,8 @@ def create_app(
         for v in snap.values():
             v["state"] = v["state"].value
             v["admin_state"] = v["admin_state"].value
+            if v["capacity"] == float("inf"):
+                v["capacity"] = "inf"
         return {"upstreams": snap}
 
     @app.get("/scenario")
@@ -125,11 +147,60 @@ def create_app(
     @app.post("/admin/upstreams/{name}/state")
     def set_state(name: str, body: StateBody):
         try:
-            rt = registry.get(name)
+            registry.get(name)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"unknown upstream: {name}")
-        rt.state = body.state
+        if body.state is UpstreamState.DISABLED:
+            registry.disable(name)
+        elif body.state is UpstreamState.HEALTHY:
+            registry.enable(name)
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="only 'disabled' and 'healthy' are supported admin transitions",
+            )
         return {"name": name, "admin_state": body.state.value}
+
+    @app.post("/admin/upstreams/{name}/policy")
+    def update_policy(name: str, body: PolicyBody):
+        try:
+            policy = registry.update_policy(
+                name,
+                weight=body.weight,
+                capacity=body.capacity,
+                refill_per_second=body.refill_per_second,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"unknown upstream: {name}")
+        for key in ("capacity", "refill_per_second"):
+            if policy[key] == float("inf"):
+                policy[key] = "inf"
+        return policy
+
+    @app.post("/admin/traffic/shift")
+    def start_shift(body: ShiftBody):
+        from gateway.traffic import TrafficShiftPlan
+
+        try:
+            return gateway.traffic.start_shift(
+                TrafficShiftPlan(
+                    shard=body.shard,
+                    source=body.source,
+                    target=body.target,
+                    start_share=body.start_share,
+                    step_share=body.step_share,
+                    step_seconds=body.step_seconds,
+                    rollback_failure_threshold=body.rollback_failure_threshold,
+                )
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=f"unknown upstream: {exc}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    @app.get("/admin/traffic/status")
+    def traffic_status(shard: str | None = None):
+        return {"shifts": gateway.traffic.status(shard)}
 
     return app
 

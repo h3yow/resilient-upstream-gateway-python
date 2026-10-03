@@ -36,6 +36,14 @@ class _TokenBucket:
                 )
             self._last = now
 
+    @property
+    def capacity(self) -> float:
+        return self._capacity
+
+    @property
+    def refill_per_second(self) -> float:
+        return self._refill
+
     def try_acquire(self, tokens: float = 1.0) -> bool:
         with self._lock:
             self._refill_locked()
@@ -53,6 +61,19 @@ class _TokenBucket:
         with self._lock:
             self._refill_locked()
             return self._tokens
+
+    def reconfigure(self, capacity: float, refill_per_second: float) -> None:
+        """运行期调整桶参数（不重启改承载能力）。
+
+        已在途的调用不受影响（它们结束时 ``refund`` 只会把令牌
+        补到新容量上限）；新容量小于当前令牌数时立即截断，
+        新请求立刻按新承载能力放行或拒绝。
+        """
+        with self._lock:
+            self._refill_locked()
+            self._capacity = capacity
+            self._refill = refill_per_second
+            self._tokens = min(self._tokens, capacity)
 
 
 class RateLimiter(_TokenBucket):
