@@ -19,7 +19,7 @@ from gateway.breaker import CircuitBreaker
 from gateway.clock import Clock, SystemClock
 from gateway.errors import UpstreamCallError, UpstreamTimeout
 from gateway.limiter import RateLimiter
-from gateway.types import UpstreamConfig, UpstreamState
+from gateway.types import RuntimePolicy, UpstreamConfig, UpstreamState
 
 
 class Upstream(Protocol):
@@ -40,6 +40,7 @@ class UpstreamRuntime:
     config: UpstreamConfig
     breaker: CircuitBreaker
     limiter: RateLimiter
+    policy: RuntimePolicy = field(default_factory=RuntimePolicy)
     state: UpstreamState = UpstreamState.HEALTHY
     active_calls: int = 0
     success_count: int = 0
@@ -122,6 +123,11 @@ class UpstreamRegistry:
             config=config,
             breaker=CircuitBreaker(config.name, config.breaker, self._clock),
             limiter=RateLimiter(config.name, config.rate_limiter, self._clock),
+            policy=RuntimePolicy(
+                weight=config.weight,
+                capacity=config.rate_limiter.capacity,
+                refill_per_second=config.rate_limiter.refill_per_second,
+            ),
         )
         with self._lock:
             self._runtimes[config.name] = rt
@@ -131,6 +137,57 @@ class UpstreamRegistry:
 
     def get(self, name: str) -> UpstreamRuntime:
         return self._runtimes[name]
+
+    # ------------------------------------------------------------------
+    # 运行期策略调整（不重启生效；只影响变更之后的新请求）
+    # ------------------------------------------------------------------
+    def update_policy(
+        self,
+        name: str,
+        *,
+        weight: int | None = None,
+        capacity: float | None = None,
+        refill_per_second: float | None = None,
+    ) -> RuntimePolicy:
+        """在线调整某副本的权重/并发承载。计数与在途请求不受影响。"""
+        rt = self._runtimes[name]
+        with rt.lock:
+            if weight is not None:
+                rt.policy.weight = max(0, int(weight))
+            new_capacity = capacity if capacity is not None else rt.policy.capacity
+            new_refill = (
+                refill_per_second
+                if refill_per_second is not None
+                else rt.policy.refill_per_second
+            )
+            if capacity is not None or refill_per_second is not None:
+                rt.policy.capacity = new_capacity
+                rt.policy.refill_per_second = new_refill
+                rt.limiter.resize(new_capacity, new_refill)
+            return RuntimePolicy(
+                weight=rt.policy.weight,
+                capacity=rt.policy.capacity,
+                refill_per_second=rt.policy.refill_per_second,
+                traffic_scale=rt.policy.traffic_scale,
+            )
+
+    def set_traffic_scale(self, name: str, scale: float) -> None:
+        """设置灰度流量比例（0.0~1.0），由灰度接管控制器调用。"""
+        rt = self._runtimes[name]
+        with rt.lock:
+            rt.policy.traffic_scale = min(1.0, max(0.0, scale))
+
+    def disable(self, name: str) -> None:
+        """临时停用：新请求立即绕开；在途请求正常跑完。"""
+        rt = self._runtimes[name]
+        with rt.lock:
+            rt.state = UpstreamState.DISABLED
+
+    def enable(self, name: str) -> None:
+        """重新启用：恢复为健康态参与选择（熔断器状态保持不变）。"""
+        rt = self._runtimes[name]
+        with rt.lock:
+            rt.state = UpstreamState.HEALTHY
 
     def impl(self, name: str) -> Upstream:
         return self._impls[name]
@@ -160,5 +217,11 @@ class UpstreamRegistry:
                     "success_count": rt.success_count,
                     "failure_count": rt.failure_count,
                     "rejection_count": rt.rejection_count,
+                    "policy": {
+                        "weight": rt.policy.weight,
+                        "capacity": rt.policy.capacity,
+                        "refill_per_second": rt.policy.refill_per_second,
+                        "traffic_scale": rt.policy.traffic_scale,
+                    },
                 }
         return out

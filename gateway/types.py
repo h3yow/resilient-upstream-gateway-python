@@ -94,6 +94,21 @@ class UpstreamConfig:
     rate_limiter: RateLimiterConfig = field(default_factory=RateLimiterConfig)
 
 
+@dataclass
+class RuntimePolicy:
+    """单个副本的运行期可变策略（区别于静态 ``UpstreamConfig``）。
+
+    支持不重启在线调整；所有字段的读写都在该副本运行时的锁内完成。
+    策略只影响**变更之后**的选择与准入判断：已经在途的请求按它
+    进入时拿到的名额正常跑完，不被中途打断。
+    """
+
+    weight: int = 1                     # 选择权重（越大越优先）
+    capacity: float = float("inf")      # 并发承载令牌桶容量
+    refill_per_second: float = float("inf")  # 令牌补充速率
+    traffic_scale: float = 1.0          # 灰度流量比例 0.0~1.0（灰度接管用）
+
+
 @dataclass(frozen=True)
 class GatewayConfig:
     """网关级编排配置。"""

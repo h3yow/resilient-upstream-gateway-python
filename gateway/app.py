@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import math
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -116,6 +118,11 @@ def create_app(
         for v in snap.values():
             v["state"] = v["state"].value
             v["admin_state"] = v["admin_state"].value
+            policy = v.get("policy")
+            if policy:
+                for k, val in policy.items():
+                    if isinstance(val, float) and not math.isfinite(val):
+                        policy[k] = "inf"
         return {"upstreams": snap}
 
     @app.get("/scenario")

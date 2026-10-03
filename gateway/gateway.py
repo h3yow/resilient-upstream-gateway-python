@@ -196,6 +196,27 @@ class Gateway:
                     break
                 continue
 
+            # 调用前准入：HALF_OPEN 下占用探测名额。筛选（would_allow）
+            # 与准入之间状态可能被并发请求改变，准入失败则快速转移。
+            # 准入成功后，下面的 record_success/record_failure 必然释放名额。
+            if not rt.breaker.allow_request():
+                rt.limiter.refund()
+                attempts.append(
+                    AttemptRecord(
+                        upstream=name,
+                        shard=shard,
+                        attempt=attempt_no + 1,
+                        outcome=_OUTCOME_CIRCUIT_OPEN,
+                        detail="circuit closed to new probes between selection and call",
+                        elapsed_seconds=0.0,
+                    )
+                )
+                attempt_no += 1
+                tried.add(name)
+                if not self._sleep_backoff(attempt_no, deadline):
+                    break
+                continue
+
             self._selector.mark_started(name)
             t0 = self._clock.now()
             remaining = deadline - t0

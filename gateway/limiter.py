@@ -54,6 +54,23 @@ class _TokenBucket:
             self._refill_locked()
             return self._tokens
 
+    def resize(self, capacity: float, refill_per_second: float) -> None:
+        """运行期调整桶容量与补充速率。
+
+        - 调大：立即补发差额令牌，新承载能力马上可用；
+        - 调小：现有令牌按新容量截断（多余令牌收回），但已经被取走、
+          正在支撑在途请求的令牌不受影响——在途请求正常跑完后
+          ``refund`` 仍只回到新容量上限。
+        """
+        with self._lock:
+            self._refill_locked()
+            if capacity > self._capacity:
+                self._tokens = min(capacity, self._tokens + (capacity - self._capacity))
+            else:
+                self._tokens = min(self._tokens, capacity)
+            self._capacity = capacity
+            self._refill = refill_per_second
+
 
 class RateLimiter(_TokenBucket):
     def __init__(self, name: str, config: RateLimiterConfig, clock: Clock) -> None:

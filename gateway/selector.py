@@ -3,8 +3,10 @@
 对某个分片，按以下规则给出候选副本名称序列：
 
 1. 管理面未停用（admin state != DISABLED）；
-2. 熔断器允许通过（CLOSED 或拿到半开探测名额）；
-   —— OPEN 冷却未过的副本直接跳过，实现"非探测流量快速失败"。
+2. 熔断器**窥视**放行（``would_allow``：CLOSED，或 HALF_OPEN 还有
+   探测名额）——筛选只看不占，探测名额由编排器在真正调用前通过
+   ``allow_request`` 获取，避免"被选中但未被调用"泄漏探测名额；
+   OPEN 冷却未过的副本直接跳过，实现"非探测流量快速失败"。
 3. 在合格副本中按 (健康优先级, 在途调用数, 加权随机) 排序：
    流量优先流向更健康、更空闲、权重更高的副本。
    随机项使用固定种子，相同输入下顺序可复现。
@@ -43,13 +45,18 @@ class UpstreamSelector:
                 if rt.state is UpstreamState.DISABLED:
                     rt.rejection_count += 1
                     continue
-                if not rt.breaker.allow_request():
+                if not rt.breaker.would_allow():
+                    rt.rejection_count += 1
+                    continue
+                # 灰度比例为 0 的副本暂不参与选择（接管未开始或已撤回）
+                if rt.policy.traffic_scale <= 0.0:
                     rt.rejection_count += 1
                     continue
                 state = rt.breaker.state()
                 priority = _HEALTH_PRIORITY.get(state, 9)
                 active = rt.active_calls
-                weight = max(1, rt.config.weight)
+                # 有效权重 = 运行期权重 × 灰度比例
+                weight = max(1e-9, rt.policy.weight * rt.policy.traffic_scale)
             tie = self._rng.random() / weight
             eligible.append((priority, active, tie, rt.config.name))
         eligible.sort(key=lambda x: (x[0], x[1], x[2]))
