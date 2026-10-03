@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import itertools
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from gateway.clock import Clock, SystemClock
 from gateway.types import UpstreamState

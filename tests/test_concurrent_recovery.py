@@ -89,7 +89,7 @@ def test_simultaneous_recovery_no_starvation_and_bounded_probes():
     _heal_all(s)
     time.sleep(0.18)  # 三个副本同时冷却到期
 
-    results = _flood(s, 24, start=100)  # 并发施压：24 个请求同时涌入
+    _flood(s, 24, start=100)  # 并发施压：24 个请求同时涌入
 
     # 1) 没有副本被饿死：三个副本都被真正探测并回到正常服务
     for name in REPLICAS:

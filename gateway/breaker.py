@@ -74,9 +74,7 @@ class CircuitBreaker:
             # HALF_OPEN：仅提示是否还有探测名额，不占用
             if self._probes_in_flight >= self.config.half_open_max_probe:
                 return False
-            if self._probes_tried >= self.config.success_to_close:
-                return False
-            return True
+            return self._probes_tried < self.config.success_to_close
 
     def allow_request(self) -> bool:
         """真正发起调用前的准入；HALF_OPEN 下占用一个探测名额。
