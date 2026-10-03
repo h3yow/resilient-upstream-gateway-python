@@ -1,9 +1,11 @@
 """FastAPI 装配：把编排器暴露为 HTTP 服务，并提供观测/管理端点。
 
 - ``POST /orchestrate``：发起编排请求，返回稳定三态响应；
-- ``GET /upstreams``：查看各上游状态与调用计数；
+- ``GET /upstreams``：查看各上游状态、运行期策略与调用计数；
 - ``GET /scenario``：查看当前注入场景；
-- ``POST /admin/upstreams/{name}/state``：手动启用/停用某副本。
+- ``POST /admin/upstreams/{name}/state``：手动启用/停用某副本；
+- ``POST /admin/upstreams/{name}/policy``：运行期调整权重/并发承载；
+- ``POST /admin/shifts`` + ``GET /admin/shifts``：发起/观测灰度接管。
 
 仅用于本地验证；生产语义以编排器返回的三态响应为准。
 """
@@ -15,6 +17,7 @@ import math
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from gateway.rollout import TrafficShiftManager
 from gateway.scenarios import SHARDS, build_gateway
 from gateway.types import (
     BreakerConfig,
@@ -51,6 +54,22 @@ class OrchestrateBody(BaseModel):
 
 class StateBody(BaseModel):
     state: UpstreamState
+
+
+class PolicyBody(BaseModel):
+    """运行期策略调整：只传要改的字段。"""
+
+    weight: int | None = None
+    capacity: float | None = None
+    refill_per_second: float | None = None
+
+
+class ShiftBody(BaseModel):
+    shard: str
+    new_replica: str
+    old_replicas: list[str]
+    steps: int = 5
+    step_interval_seconds: float = 0.2
 
 
 def _response_to_dict(resp) -> dict:
@@ -95,6 +114,8 @@ def create_app(
     )
     gateway = built.gateway
     registry = built.registry
+    shift_manager = TrafficShiftManager(registry)
+    gateway.shift_manager = shift_manager
 
     app = FastAPI(title="Resilient Upstream Gateway", version="0.1.0")
 
@@ -132,11 +153,66 @@ def create_app(
     @app.post("/admin/upstreams/{name}/state")
     def set_state(name: str, body: StateBody):
         try:
-            rt = registry.get(name)
+            registry.get(name)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"unknown upstream: {name}")
-        rt.state = body.state
+        if body.state is UpstreamState.DISABLED:
+            registry.disable(name)
+        elif body.state is UpstreamState.HEALTHY:
+            registry.enable(name)
+        else:
+            rt = registry.get(name)
+            with rt.lock:
+                rt.state = body.state
         return {"name": name, "admin_state": body.state.value}
+
+    @app.post("/admin/upstreams/{name}/policy")
+    def set_policy(name: str, body: PolicyBody):
+        """运行期调整权重/并发承载，不重启生效；只影响之后的新请求。"""
+        try:
+            policy = registry.update_policy(
+                name,
+                weight=body.weight,
+                capacity=body.capacity,
+                refill_per_second=body.refill_per_second,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"unknown upstream: {name}")
+        return {
+            "name": name,
+            "policy": {
+                "weight": policy.weight,
+                "capacity": policy.capacity if math.isfinite(policy.capacity) else "inf",
+                "refill_per_second": (
+                    policy.refill_per_second
+                    if math.isfinite(policy.refill_per_second)
+                    else "inf"
+                ),
+                "traffic_scale": policy.traffic_scale,
+            },
+        }
+
+    @app.post("/admin/shifts")
+    def begin_shift(body: ShiftBody):
+        """发起灰度接管：新副本从小流量开始按节奏加码。"""
+        try:
+            shift_id = shift_manager.begin_shift(
+                body.shard,
+                body.new_replica,
+                body.old_replicas,
+                steps=body.steps,
+                step_interval_seconds=body.step_interval_seconds,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        return {"shift_id": shift_id}
+
+    @app.get("/admin/shifts")
+    def shifts():
+        """各接管的进度、状态与当前实际流量比例。"""
+        return {"shifts": shift_manager.status()}
 
     return app
 

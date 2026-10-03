@@ -84,3 +84,59 @@ def test_upstreams_snapshot_endpoint():
     assert total_ok == len(SHARDS)
     assert all(v["active_calls"] == 0 for v in body.values())
     print(f"[场景] /upstreams 显示 {total_ok} 次成功计数，与 3 个分片一致")
+
+
+def test_admin_policy_update_over_http():
+    """运行期调权重：调 0 后新请求不再命中该副本，/upstreams 可看到策略。"""
+    c = _client({})
+    r = c.post("/admin/upstreams/orders-0/policy", json={"weight": 0})
+    assert r.status_code == 200
+    assert r.json()["policy"]["weight"] == 0
+    body = c.post(
+        "/orchestrate", json={"request_id": "p1", "shards": ["orders"]}
+    ).json()
+    orders = next(t for t in body["trace"] if t["shard"] == "orders")
+    assert orders["served_by"] == "orders-1"
+    snap = c.get("/upstreams").json()["upstreams"]
+    assert snap["orders-0"]["policy"]["weight"] == 0
+    print("[场景] HTTP 调权重 1000->0（默认1->0）后新请求全部转移 orders-1，"
+          "判定依据: served_by 与 /upstreams policy 一致")
+
+
+def test_admin_policy_unknown_upstream_404():
+    c = _client({})
+    r = c.post("/admin/upstreams/nope/policy", json={"weight": 2})
+    assert r.status_code == 404
+    print("[场景] 对不存在副本调策略 -> 404")
+
+
+def test_admin_shift_begin_and_status_over_http():
+    """发起接管后可轮询进度；完成后新副本流量比例为 1。"""
+    c = _client({})
+    r = c.post("/admin/shifts", json={
+        "shard": "orders", "new_replica": "orders-1",
+        "old_replicas": ["orders-0"], "steps": 2,
+        "step_interval_seconds": 0.05,
+    })
+    assert r.status_code == 200
+    shift_id = r.json()["shift_id"]
+    st = c.get("/admin/shifts").json()["shifts"][shift_id]
+    assert st["state"] == "ramping"
+    assert st["traffic_share"]["orders-1"] == 0.5
+    import time
+    time.sleep(0.12)
+    c.post("/orchestrate", json={"request_id": "s1", "shards": ["orders"]})
+    st = c.get("/admin/shifts").json()["shifts"][shift_id]
+    assert st["state"] == "completed"
+    assert st["traffic_share"]["orders-1"] == 1.0
+    print(f"[场景] HTTP 发起接管 {shift_id}：ramping(0.5) -> completed(1.0)，"
+          "进度与流量比例可轮询观测")
+
+
+def test_admin_shift_unknown_replica_404():
+    c = _client({})
+    r = c.post("/admin/shifts", json={
+        "shard": "orders", "new_replica": "orders-9", "old_replicas": ["orders-0"],
+    })
+    assert r.status_code == 404
+    print("[场景] 对不存在副本发起接管 -> 404")

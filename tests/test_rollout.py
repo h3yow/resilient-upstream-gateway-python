@@ -37,7 +37,7 @@ def test_gradual_takeover_with_observable_progress():
     """新副本按节奏加码直到完全替下旧副本；每步流量比例可直接观测。"""
     s = build_gateway(config=CONF, breaker=FAST)
     mgr = TrafficShiftManager(s.registry)
-    s.gateway._shift_manager = mgr
+    s.gateway.shift_manager = mgr
 
     shift_id = mgr.begin_shift(
         "orders", "orders-1", ["orders-0"], steps=4, step_interval_seconds=0.05
@@ -82,7 +82,7 @@ def test_ramp_rolls_back_automatically_when_new_replica_errors():
         config=CONF, breaker=FAST,
     )
     mgr = TrafficShiftManager(s.registry)
-    s.gateway._shift_manager = mgr
+    s.gateway.shift_manager = mgr
 
     shift_id = mgr.begin_shift(
         "orders", "orders-1", ["orders-0"], steps=10, step_interval_seconds=0.05

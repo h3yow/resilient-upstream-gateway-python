@@ -62,7 +62,8 @@ class Gateway:
         self._clock = clock or SystemClock()
         self._selector = selector or UpstreamSelector(registry)
         self._retry_budget = retry_budget or RetryBudget(self.config.retry, self._clock)
-        self._shift_manager = shift_manager
+        # 灰度接管控制器（可选）：每请求惰性推进加码/撤回评估
+        self.shift_manager = shift_manager
         self._executor = executor or ThreadPoolExecutor(
             max_workers=self.config.max_workers, thread_name_prefix="gw"
         )
@@ -75,8 +76,8 @@ class Gateway:
         shards = list(request.shards)
 
         # 惰性推进灰度接管：按当前时钟评估加码档位/健康护栏
-        if self._shift_manager is not None:
-            self._shift_manager.refresh()
+        if self.shift_manager is not None:
+            self.shift_manager.refresh()
 
         future_map = {
             self._executor.submit(self._handle_shard, request.request_id, shard, deadline): shard
