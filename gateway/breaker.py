@@ -42,6 +42,8 @@ class CircuitBreaker:
         self._probes_in_flight = 0
         # 半开期间被放行过的总探测数（成功闭合后重置）
         self._probes_tried = 0
+        # 历史累计准入的探测数（只增不减，用于断言探测有上界）
+        self._probes_admitted_total = 0
 
     def _maybe_enter_half_open_locked(self) -> None:
         """冷却已过则 OPEN -> HALF_OPEN（调用方持锁）。"""
@@ -96,7 +98,14 @@ class CircuitBreaker:
                 return False
             self._probes_in_flight += 1
             self._probes_tried += 1
+            self._probes_admitted_total += 1
             return True
+
+    @property
+    def probes_admitted_total(self) -> int:
+        """历史累计准入探测数：断言"探测有上界"的直接依据。"""
+        with self._lock:
+            return self._probes_admitted_total
 
     def record_success(self) -> None:
         with self._lock:
